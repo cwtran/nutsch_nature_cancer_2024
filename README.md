@@ -1,10 +1,10 @@
-# Nutsch et al. Nature Cancer (2024)
-This repository contains metadata and R code used to generate Fig 7 and Ext Fig 10 derived from human RNAseq and scRNAseq datasets presented in Nutsch, K., Banta, K.L. et al. Nature Cancer (in press; 2024).
+# Nutsch et al. _Nature Cancer_ (2024)
+This repository contains metadata and R code used to generate Fig 7 and Ext Fig 10 derived from human RNAseq and scRNAseq datasets presented in Nutsch, K., Banta, K.L. et al. _Nature Cancer_ (in press; 2024).
 
 Human sequencing data is available at: https://ega-archive.org/studies/EGAS50000000251 You will need to accept the terms and request access to download these data.
 
 # Requirements
-Data analysis was performed with R on a private HPC (Linux) but could be performed locally given sufficient memory. Please note that some parts of the scRNAseq analysis may temporarily require >200GB of free memory. All packages used in the analysis (all freely available from CRAN or the respective developer repository) are listed below.
+Data analysis was performed with R on a private HPC (Linux) but could be performed locally given sufficient memory. Please note that some parts of the scRNAseq analysis may temporarily require **>200GB** of free memory. All packages used in the analysis (all freely available from CRAN or the respective developer repository) are listed below.
 
 - R 4.2.0
 - survival 3.3-1
