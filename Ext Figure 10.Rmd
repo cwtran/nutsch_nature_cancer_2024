@@ -1,0 +1,269 @@
+---
+title: "Extended Figure 10"
+output: html_notebook
+author: "Charles Tran"
+date: "Jul 30, 2024"
+---
+
+# Environment Setup
+## Load libraries
+```{r}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(rstatix)
+library(ggpubr)
+library(babelgene)
+```
+
+## Colors and cluster labels for the scRNAseq object
+```{r}
+custom.cluster.colors <- c("#BDBDBD", "#737373", "#C6DBEF", "#6BAED6", "#2171B5", "#8DD3C7", "#238B45", "#74C476", "#FDB462", "#FFED6F", "#BCBDDC", "#807DBA", "#A50F15", "#EF3B2C", "#FC9272", "#FEE0D2")
+names(custom.cluster.colors) <- c("Naive.1", "Naive.2", "Ccr7.1", "Ccr7.2", "Ccr7.3", "Egr", "Ifng", "Ifit", "Mitotic", "Cxcr3", "Ccl5.1", "Ccl5.2", "Cytotox.1", "Cytotox.2", "Cytotox.3", "Cytotox.4")
+```
+
+## Define functions
+```{r}
+RenameGenesSeurat <- function(obj = ls.Seurat[[i]], newnames = HGNC.updated[[i]]$Suggested.Symbol) { 
+  RNA <- obj@assays$RNA
+
+  if (nrow(RNA) == length(newnames)) {
+    if (length(RNA@counts)) RNA@counts@Dimnames[[1]] <- newnames
+    if (length(RNA@data)) RNA@data@Dimnames[[1]] <- newnames
+    if (length(RNA@scale.data)) RNA@scale.data@Dimnames[[1]] <- newnames
+  } else {"Unequal gene sets: nrow(RNA) != nrow(newnames)"}
+  obj@assays$RNA <- RNA
+  return(obj)
+}
+```
+
+# Load Data
+## Load integrated mouse CD8 Seurat object and add labels
+```{r}
+# refer to GSE220901 (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=gse220901)
+# the cd8.0.8.RData is a seurat object that was generated from the raw data and metadata available at the above location
+load("cd8.0.8.RData")
+p2 <- read.csv("ngs4175.cd8.0.8.umap",row.names=1,header=T,sep="\t")
+source("Ident/ident.sep1.R")
+ident.f <- factor(p2$cluster,levels=ident.order,labels=ident.labels)
+Idents(object = cd8.obj) <- ident.f
+```
+
+# Load annotated human PBMC scRNAseq data
+```{r}
+# refer to scRNAseq data (including metadata) deposited at https://ega-archive.org/datasets/EGAD50000000370
+# you will have to create a seurat object from the raw counts and associated metadata and then on T cells
+# the steps below start from loading a saved seurat object
+tcells <- readRDS("~/go30103/tcells_annotated_v2.rds")
+
+# normalize ADT Assay
+tcells <- NormalizeData(tcells, normalization.method = "CLR", margin = 2, assay = "ADT")
+
+# subset on CD8 by ADT levels
+tcells.cd8 <- subset(tcells, subset = `adt_AC-CD8` > 1)
+```
+
+
+# Mapping mouse CD8 T cells to a human scRNAseq reference
+
+## Human to mouse gene conversion
+```{r}
+# read in tcells from Seurat object first
+cd8.query.genes <- row.names(tcells.cd8@assays$RNA@counts)
+
+# used babelgene for ortholog mapping
+genes.temp <- orthologs(genes = cd8.query.genes, species = "mouse", human = T)
+genes.temp <- genes.temp %>% dplyr::select(human_symbol, symbol) %>% arrange(factor(human_symbol, levels = cd8.query.genes))
+
+# some query human genes may map to multiple orthologs - remove any duplicates
+genes.temp <- genes.temp[!duplicated(genes.temp$human_symbol),]
+
+cd8.query.mapped <- data.frame(query.gene = cd8.query.genes)
+
+cd8.query.mapped <- left_join(cd8.query.mapped, genes.temp, by = c("query.gene" = "human_symbol"))
+cd8.query.mapped <- cd8.query.mapped %>% mutate(symbol = coalesce(symbol, query.gene))
+
+# directly modify seurat object to rename genes (from human to mouse)
+tcells.cd8 <- RenameGenesSeurat(tcells.cd8, cd8.query.mapped$symbol)
+```
+
+
+## SCTransform and IntegrateData 
+Note that the standard integration workflow failed with 900GB RAM so reference-based integration was used instead. 
+See https://satijalab.org/seurat/archive/v4.3/integration_large_datasets for more details
+Sample #2 was randomly chosen as the integration reference
+```{r}
+tcells.list <- SplitObject(tcells.cd8, split.by = "Patient")
+
+tcells.list <- lapply(X = tcells.list, FUN = function(x) {
+  x <- SCTransform(x, method = "glmGamPoi", verbose = F)
+})
+
+# remove both mouse and human TCR genes from the integration features
+tcells.features <- SelectIntegrationFeatures(object.list = tcells.list, nfeatures = 3000)
+tcells.features <- tcells.features[!grepl('TRAV|TRBV|TRDV|TRGV|Trav|Trbv|Trdv|Trgv', tcells.features)]
+
+tcells.list <- PrepSCTIntegration(object.list = tcells.list, anchor.features = tcells.features)
+tcells.list <- lapply(X = tcells.list, FUN = RunPCA, features = tcells.features, verbose = F)
+
+# find integration anchors - takes ~40min to run
+tcells.anchors <- FindIntegrationAnchors(object.list = tcells.list, normalization.method="SCT", anchor.features = tcells.features, dims = 1:30, reduction = "rpca", k.anchor = 20, reference = 2)
+```
+
+## Integrate data and query against mouse "reference"
+```{r}
+# make sure you have sufficient memory
+cd8.int <- IntegrateData(anchorset = tcells.anchors, normalization.method = "SCT", dims = 1:30)
+cd8.int <- RunPCA(cd8.int, verbose = F)
+cd8.obj[["integrated"]] <- as(object=cd8.obj[["integrated"]], Class = "SCTAssay")
+transfer.anchors <- FindTransferAnchors(reference = cd8.obj, query = cd8.int, dims = 1:30, reference.reduction="pca", normalization.method="SCT", recompute.residuals = F)
+cd8.obj$celltype <- Idents(cd8.obj)
+cd8.int <- MapQuery(anchorset = transfer.anchors, reference = cd8.obj, query = cd8.int, refdata = list(celltype = "celltype"), reference.reduction = "pca", reduction.model = "umap")
+```
+
+# Ext Fig 10a
+Plot UMAP
+```{r}
+# UMAP of reference and queried cells
+# only p2 was used in the paper but p1+p2 are plotted for your reference
+p1 <- DimPlot(cd8.obj, reduction = "umap", group.by = "celltype", label = T, repel = T, cols = custom.cluster.colors) + NoLegend() + ggtitle("Reference annotations")
+p2 <- DimPlot(cd8.int, reduction = "ref.umap", group.by="predicted.celltype", label = T, repel = T, cols = custom.cluster.colors) + NoLegend() + ggtitle("Ph1b CD8 T cells Mapped to Reference")
+p1+p2
+```
+
+# Ext Fig 10b
+Plot violin plots / boxplots of prediction scores
+```{r}
+tcells.cd8.metadata.with.mapping <- readRDS("input/tcells.cd8.metadata.with.mapping.rds")
+
+# plot prediction score
+ggplot(tcells.cd8.metadata.with.mapping, aes(x=predicted.celltype, y=predicted.celltype.score, fill=predicted.celltype)) + geom_violin(trim=FALSE, size =0.4, width=1.5) + geom_boxplot(width=0.1, size=0.4) + scale_fill_manual(values = custom.cluster.colors) + theme_bw(base_size = 16) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+```
+
+# Ext Fig 10c
+Plot relative frequency for each T cell subset by ORR 
+```{r}
+# custom colors for plotting response
+response_colors <- c('#d7191c','#fdae61','#abdda4','#2b83ba')
+names(response_colors) <- c("CR", "PR", "SD", "PD")
+
+response_colors2 <- c('#fdae61', '#2b83ba')
+
+# group by ORR
+meta.response.temp1 <- tcells.cd8.metadata.with.mapping %>% dplyr::select(predicted.celltype, Patient, ARM4, timepoint, ARM, ORR_CRPR_SDPD) %>% group_by(Patient, ORR_CRPR_SDPD, predicted.celltype) %>% dplyr::count()
+
+meta.response.temp2 <- tcells.cd8.metadata.with.mapping  %>% dplyr::select(predicted.celltype, Patient, ARM4, timepoint, ORR_CRPR_SDPD) %>% group_by(Patient, ORR_CRPR_SDPD) %>% dplyr::count()
+meta.response.temp2 <- meta.response.temp2 %>% dplyr::rename("total_n" = "n")
+
+meta.response.joined <- left_join(meta.response.temp1, meta.response.temp2, by = c("Patient", "ORR_CRPR_SDPD"))
+meta.response.joined <- meta.response.joined %>% mutate(percent.total = n / total_n * 100)
+
+# plot populations by ORR
+stat.orr.all.celltypes <- meta.response.joined %>% group_by(predicted.celltype) %>% wilcox_test(percent.total ~ ORR_CRPR_SDPD) %>% adjust_pvalue(method="BH") %>% add_significance("p.adj") %>% add_xy_position(x = "predicted.celltype")
+
+ggplot(meta.response.joined, aes(x = predicted.celltype, y=percent.total, color=ORR_CRPR_SDPD)) + geom_boxplot(aes(fill=ORR_CRPR_SDPD), alpha = 0.5, outlier.shape=NA) + geom_point(aes(fill=ORR_CRPR_SDPD), color="black", position = position_jitterdodge(jitter.width=0.1, dodge.width=0.7), pch = 21) + scale_color_manual(values = response_colors2) + scale_fill_manual(values = response_colors2) + theme_bw(base_size=16) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1)) + stat_pvalue_manual(stat.orr.all.celltypes, hide.ns=F, tip.length=0)
+
+```
+
+
+# Ext Fig 10d
+HR of cell signatures
+```{r}
+OS.HR.high.list <- list()
+OS.HR.low.list <- list()
+
+# add CD8A as a single gene to signature list for comparison
+gsl <- length(human.genes.from.mouse.sig.intersect) + 1
+
+# csv file can be found in the Supplemental Data section of the online manuscript or is alternatively provided as a RDS file (see "input" folder)
+human.genes.from.mouse.sig.intersect <- readRDS("input/human.genes.from.mouse.scrnaseq.clusters.2023-03-20.rds")
+human.genes.from.mouse.sig.intersect[[gsl]] <- "CD8A"
+names(human.genes.from.mouse.sig.intersect)[gsl] <- "CD8A"
+
+for (k in 1:length(human.genes.from.mouse.sig.intersect)) {
+  # gene.sig <- human.genes.from.mouse.sig.intersect[[k]]
+  sig.name <- names(human.genes.from.mouse.sig.intersect[k])
+  sig.name.hl <- paste0(names(human.genes.from.mouse.sig.intersect[k]), ".hl", sep="")
+  
+  tpm_annotated_scores_high <- tpm_annotated_scores %>% filter(!!sym(sig.name.hl) == "high")
+  tpm_annotated_scores_low <- tpm_annotated_scores %>% filter(!!sym(sig.name.hl) == "low")
+  
+  # factor to compare tira_atezo vs placebo_atezo
+  tpm_annotated_scores_high$ACTARM.2 <- factor(tpm_annotated_scores_high$ACTARM.2, levels = c( "placebo_atezo", "tira_atezo"))
+  tpm_annotated_scores_low$ACTARM.2 <- factor(tpm_annotated_scores_low$ACTARM.2, levels = c("placebo_atezo", "tira_atezo"))
+
+  # calculate coxph
+  OS.HR.sig.high <- coxph( Surv(OS_MONTHS, OS_CENSOR) ~ ACTARM.2, data = tpm_annotated_scores_high)
+  OS.HR.sig.low <- coxph( Surv(OS_MONTHS, OS_CENSOR) ~ ACTARM.2, data = tpm_annotated_scores_low)
+  
+  # convert to df
+  OS.HR.sig.high.df <- cox_as_data_frame(OS.HR.sig.high) %>% mutate(gene.sig = paste(sig.name, "high"))
+  OS.HR.sig.low.df <- cox_as_data_frame(OS.HR.sig.low) %>% mutate(gene.sig = paste(sig.name, "low"))
+  
+  # add to list of dataframes
+  OS.HR.high.list[[k]] <- OS.HR.sig.high.df
+  OS.HR.low.list[[k]] <- OS.HR.sig.low.df
+
+}
+
+# combine df
+OS.HR.high.sig.df <- Reduce(full_join, OS.HR.high.list)
+OS.HR.low.sig.df <- Reduce(full_join, OS.HR.low.list)
+
+OS.HR.all.sig.df <- rbind(OS.HR.high.sig.df, OS.HR.low.sig.df)
+
+highlow <- c("low", "high")
+named.sig <- NULL
+for (n in 1:length(human.genes.from.mouse.sig.intersect)) {
+   sig.name <- names(human.genes.from.mouse.sig.intersect[n])
+   for (l in 1:length(highlow)) {
+     temp.name <- paste(sig.name, highlow[l])
+     named.sig <- c(named.sig, temp.name)
+   }
+}
+
+# re-order levels
+OS.HR.all.sig.df$gene.sig = factor(OS.HR.all.sig.df$gene.sig, levels = rev(named.sig))
+
+# plot HR forest plot (with p values)
+# adjust plot margin to 1,8,1,1 to increase right margin if desired
+ggplot(OS.HR.all.sig.df, aes(x = gene.sig, y = HR, fill=gene.sig)) + geom_errorbar(aes(ymin = Lower_CI, ymax = Upper_CI), width=0.1, position=position_dodge(0.8)) + geom_point(aes(fill=gene.sig), pch=21, color="black", size=4) + geom_hline(yintercept=1, linetype="dashed", color="red", size = 1) + theme_bw(base_size=14) + coord_flip(clip = "off") + scale_y_continuous(breaks = seq(0.1, 2, by = 0.2), limits=c(0.1, 2)) + theme(panel.grid=element_blank(), legend.position = "none", plot.margin = unit(c(1, 1, 1, 1), "lines")) + geom_text(aes(label = paste(sprintf('%.3f', p), " | ", sprintf('%.2f', HR), sep="")), y = 2.05, check_overlap = TRUE, hjust = 1)
+
+```
+
+
+# Ext Fig 10e
+KM plots of various scRNAseq signatures
+```{r}
+# below assumes you have already loaded CITYSCAPE data and libraries used for Fig 7
+# generate OS plots
+OS.plot.list <- list()
+OS.survfit.list <- list()
+
+for (d in 1:length(human.genes.from.mouse.sig.intersect)) {
+  sig.name <- names(human.genes.from.mouse.sig.intersect[d])
+  sig.name.var <- paste0("ARM_", sig.name)
+  
+  OS.plot.list[[d]] <- ggsurvplot(
+    fit = survfit(as.formula(paste0("Surv(OS_MONTHS, OS_CENSOR) ~ ", sig.name.var)), data = tpm_annotated_scores),
+    xlab = "Months",
+    xlim = c(0, 36), # added 36 month xlim to make scale more accurate for data
+    ylab = "OS",
+    legend.title = paste(sig.name, "Score"), 
+   legend.labs = c("P+A high", "P+A low", "T+A high", "T+A low"),
+    surv.median.line = "hv",
+    palette = "npg",
+    risk.table = F,
+    pval = T,
+    conf.int = F,
+    break.time.by = 3,
+    risk.table.y.text.col = T,
+    tables.theme = theme_cleantable(),
+    tables.height = 0.2,
+    tables.y.text = FALSE) 
+}
+
+OS.all.sig <- arrange_ggsurvplots(OS.plot.list, print = TRUE, ncol = 5, nrow = 4)
+print(OS.all.sig)
+
+```
